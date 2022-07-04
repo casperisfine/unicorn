@@ -114,25 +114,41 @@ module Unicorn
 
   def self.pipe # :nodoc:
     Kgio::Pipe.new.each do |io|
-      # shrink pipes to minimize impact on /proc/sys/fs/pipe-user-pages-soft
-      # limits.
-      if defined?(F_SETPIPE_SZ)
-        begin
-          io.fcntl(F_SETPIPE_SZ, Raindrops::PAGE_SIZE)
-        rescue Errno::EINVAL
-          # old kernel
-        rescue Errno::EPERM
-          # resizes fail if Linux is close to the pipe limit for the user
-          # or if the user does not have permissions to resize
-        end
+      shrink_pipe(io)
+    end
+  end
+
+  def self.shrink_pipe(io) # :nodoc:
+    # shrink pipes to minimize impact on /proc/sys/fs/pipe-user-pages-soft
+    # limits.
+    if defined?(F_SETPIPE_SZ)
+      begin
+        io.fcntl(F_SETPIPE_SZ, Raindrops::PAGE_SIZE)
+      rescue Errno::EINVAL
+        # old kernel
+      rescue Errno::EPERM
+        # resizes fail if Linux is close to the pipe limit for the user
+        # or if the user does not have permissions to resize
       end
     end
+  end
+
+  def self.atomic_write(path, content, mode = 0644) # :nodoc:
+    fp = begin
+      tmp = "#{File.dirname(path)}/#{rand}.#$$"
+      File.open(tmp, File::RDWR|File::CREAT|File::EXCL, mode)
+    rescue Errno::EEXIST
+      retry
+    end
+    fp.syswrite("#$$\n")
+    File.rename(fp.path, path)
+    fp.close
   end
   # :startdoc:
 end
 # :enddoc:
 
 %w(const socket_helper stream_input tee_input http_request configurator
-   tmpio util http_response worker http_server).each do |s|
+   tmpio util http_response worker refork_order http_server).each do |s|
   require_relative "unicorn/#{s}"
 end

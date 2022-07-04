@@ -1,5 +1,7 @@
 # -*- encoding: binary -*-
 
+require "child_subreaper"
+
 # This is the process manager of Unicorn. This manages worker
 # processes which in turn handle the I/O and application process.
 # Listener sockets are started in the master process and shared with
@@ -16,7 +18,7 @@ class Unicorn::HttpServer
                 :listener_opts, :preload_app,
                 :orig_app, :config, :ready_pipe, :user,
                 :default_middleware, :early_hints
-  attr_writer   :after_worker_exit, :after_worker_ready, :worker_exec
+  attr_writer   :after_worker_exit, :after_worker_ready, :worker_exec, :worker_refork
 
   attr_reader :pid, :logger
   include Unicorn::SocketHelper
@@ -89,6 +91,7 @@ class Unicorn::HttpServer
     # Unicorn::Worker class for the pipe workers use.
     @self_pipe = []
     @workers = {} # hash maps PIDs to Workers
+    @pending_reforks = []
     @sig_queue = [] # signal queue used for self-piping
     @pid = nil
 
@@ -106,7 +109,7 @@ class Unicorn::HttpServer
     @orig_app = app
     # list of signals we care about and trap in master.
     @queue_sigs = [
-      :WINCH, :QUIT, :INT, :TERM, :USR1, :USR2, :HUP, :TTIN, :TTOU ]
+      :WINCH, :QUIT, :INT, :TERM, :USR1, :USR2, :HUP, :TTIN, :TTOU, :URG ]
 
     @worker_data = if worker_data = ENV['UNICORN_WORKER']
       worker_data = worker_data.split(',').map!(&:to_i)
@@ -119,6 +122,8 @@ class Unicorn::HttpServer
 
   # Runs the thing.  Returns self so you can run join on it
   def start
+    @original_timeout = @timeout
+
     inherit_listeners!
     # this pipe is used to wake us up from select(2) in #join when signals
     # are trapped.  See trap_deferred.
@@ -140,7 +145,24 @@ class Unicorn::HttpServer
     build_app! if preload_app
     bind_new_listeners!
 
-    spawn_missing_workers
+    if @worker_refork
+      if ChildSubreaper::AVAILABLE
+        ChildSubreaper.enable
+      else
+        logger.warn("prctl(2) PR_SET_CHILD_SUBREAPER is not available on this platform. Can't enable worker_refork.")
+        # TODO: @worker_refork = false
+      end
+
+      unless File.respond_to?(:mkfifo)
+        logger.warn("File.mkfifo is not available on this platform. Can't enable worker_refork.")
+        @worker_refork = false
+      end
+
+      @tmpdir = Dir.mktmpdir("unicorn-#{$$}-")
+    else
+      @tmpdir = nil
+    end
+    spawn_missing_workers(true)
     self
   end
 
@@ -181,15 +203,7 @@ class Unicorn::HttpServer
   def clobber_pid(path)
     unlink_pid_safe(@pid) if @pid
     if path
-      fp = begin
-        tmp = "#{File.dirname(path)}/#{rand}.#$$"
-        File.open(tmp, File::RDWR|File::CREAT|File::EXCL, 0644)
-      rescue Errno::EEXIST
-        retry
-      end
-      fp.syswrite("#$$\n")
-      File.rename(fp.path, path)
-      fp.close
+      Unicorn.atomic_write(path, "#{$$}\n")
     end
   end
 
@@ -305,6 +319,8 @@ class Unicorn::HttpServer
         soft_kill_each_worker(:USR1)
       when :USR2 # exec binary, stay alive in case something went wrong
         reexec
+      when :URG # refork happened
+        register_reforked_workers
       when :WINCH
         if $stdin.tty?
           logger.info "SIGWINCH ignored because we're not daemonized"
@@ -334,6 +350,7 @@ class Unicorn::HttpServer
     stop # gracefully shutdown all workers on our way out
     logger.info "master complete"
     unlink_pid_safe(pid) if pid
+    unlink_tmpdir_safe(@tmpdir) if @tmpdir
   end
 
   # Terminates all workers, but does not exit master process
@@ -406,11 +423,39 @@ class Unicorn::HttpServer
         proc_name 'master'
       else
         worker = @workers.delete(wpid) and worker.close rescue nil
+
+        # TODO: do we have a race condition here?
+        #. - worker refork.
+        #. - worker die (send SIGCHLD).
+        #. - we reap it.
+        #. - reforked worker is ready (send SIGURG).
+        #. - we no longer know about it.
+        # MAYBE: can we use raindop to timeout refork orders?
+        @pending_reforks.select { |ro| ro.worker == worker }.each do |ro|
+          @pending_reforks.delete(ro)
+          ro.close
+        end
+
         @after_worker_exit.call(self, worker, status)
       end
     rescue Errno::ECHILD
       break
     end while true
+  end
+
+  def register_reforked_workers
+    @pending_reforks.dup.each do |refork_order|
+      if pid = refork_order.pid
+        begin
+          @pending_reforks.delete(refork_order)
+          @workers[pid] = refork_order.create_worker_parent
+        rescue => error
+          logger.error "refork failed PID:#{pid}: #{error.class}: #{error.message}"
+        ensure
+          refork_order.close
+        end
+      end
+    end
   end
 
   # reexecutes the START_CTX with a new binary
@@ -519,14 +564,14 @@ class Unicorn::HttpServer
     @self_pipe.each(&:close).clear # this is master-only, now
     @ready_pipe.close if @ready_pipe
     Unicorn::Configurator::RACKUP.clear
-    @ready_pipe = @init_listeners = @before_exec = @before_fork = nil
+    @ready_pipe = @before_exec = nil
 
     # The OpenSSL PRNG is seeded with only the pid, and apps with frequently
     # dying workers can recycle pids
     OpenSSL::Random.seed(rand.to_s) if defined?(OpenSSL::Random)
   end
 
-  def spawn_missing_workers
+  def spawn_missing_workers(initial = false)
     if @worker_data
       worker = Unicorn::Worker.new(*@worker_data)
       after_fork_internal
@@ -537,6 +582,24 @@ class Unicorn::HttpServer
     worker_nr = -1
     until (worker_nr += 1) == @worker_processes
       @workers.value?(worker_nr) and next
+      @pending_reforks.include?(worker_nr) and next
+
+      if @worker_refork && !initial
+        # Note: we could use raindrop to signal which workers are currently busy
+        # and use that to hopefully signal a free worker.
+        # However it would still be subject to a race condition, and it's probably
+        # best to focus on selecting the worker that will allow to share the most memory
+        # even if we may need to wait for it to finish its current request.
+        if worker = @workers.values.last
+          refork_order = Unicorn::ReforkOrder.new(worker_nr, worker, @tmpdir)
+          @pending_reforks << refork_order
+          worker.soft_kill(:URG, worker_nr)
+          next
+        else
+          initial = true
+        end
+      end
+
       worker = Unicorn::Worker.new(worker_nr)
       before_fork.call(self, worker)
 
@@ -557,7 +620,7 @@ class Unicorn::HttpServer
   end
 
   def maintain_worker_count
-    (off = @workers.size - worker_processes) == 0 and return
+    (off = @workers.size + @pending_reforks.size - worker_processes) == 0 and return
     off < 0 and return spawn_missing_workers
     @workers.each_value { |w| w.nr >= worker_processes and w.soft_kill(:QUIT) }
   end
@@ -668,30 +731,63 @@ class Unicorn::HttpServer
   # to free some resources and drops all sig handlers.
   # traps for USR1, USR2, and HUP may be set in the after_fork Proc
   # by the user.
-  def init_worker_process(worker)
+  def init_worker_process(worker, refork = false)
     worker.atfork_child
+
     # we'll re-trap :QUIT later for graceful shutdown iff we accept clients
     exit_sigs = [ :QUIT, :TERM, :INT ]
     exit_sigs.each { |sig| trap(sig) { exit!(0) } }
     exit!(0) if (@sig_queue & exit_sigs)[0]
     (@queue_sigs - exit_sigs).each { |sig| trap(sig, nil) }
     trap(:CHLD, 'DEFAULT')
+
     @sig_queue.clear
     proc_name "worker[#{worker.nr}]"
-    START_CTX.clear
     @workers.clear
+    @pending_reforks.clear
 
     after_fork.call(self, worker) # can drop perms and create listeners
     LISTENERS.each { |sock| sock.close_on_exec = true }
 
-    worker.user(*user) if user.kind_of?(Array) && ! worker.switched
-    @config = nil
-    build_app! unless preload_app
-    @after_fork = @listener_opts = @orig_app = nil
+    worker.user(*user) if !refork && user.kind_of?(Array) && ! worker.switched
+    build_app! if !preload_app && !refork
+    @listener_opts = @orig_app = nil
     readers = LISTENERS.dup
     readers << worker
+
     trap(:QUIT) { nuke_listeners!(readers) }
+    trap(:URG) { |nr| refork_worker(nr, worker) }
+
     readers
+  end
+
+  def refork_worker(nr, parent_worker)
+    refork_order = Unicorn::ReforkOrder.new(nr, parent_worker, @tmpdir)
+    worker = refork_order.create_worker_child
+    before_fork.call(self, worker) # TODO: should we have a before_refork instead?
+
+    rd, wr = Unicorn.pipe
+    tmp_pid = fork do
+      wr.close
+      refork_pid = fork do
+        parent_worker.close
+        after_fork_internal
+        if rd.kgio_wait_readable(5) # Give 5 seconds to the original worker to tell us the parent was re-assigned.
+          rd.close
+          refork_order.register_to_parent(worker)
+          worker_loop(worker)
+        else
+          exit!(1)
+        end
+      end
+      exit!(0)
+    end
+    rd.close
+    worker.close
+    Process.wait(tmp_pid)
+    wr.syswrite(".")
+    wr.close
+    after_fork.call(self, parent_worker)
   end
 
   def reopen_worker_logs(worker_nr)
@@ -706,11 +802,11 @@ class Unicorn::HttpServer
 
   def prep_readers(readers)
     wtr = Unicorn::Waiter.prep_readers(readers)
-    @timeout *= 500 # to milliseconds for epoll, but halved
+    @timeout = @original_timeout * 500 # to milliseconds for epoll, but halved
     wtr
   rescue
     require_relative 'select_waiter'
-    @timeout /= 2.0 # halved for IO.select
+    @timeout = @original_timeout / 2.0 # halved for IO.select
     Unicorn::SelectWaiter.new
   end
 
@@ -774,6 +870,10 @@ class Unicorn::HttpServer
   # window for hitting the race condition is small
   def unlink_pid_safe(path)
     (File.read(path).to_i == $$ and File.unlink(path)) rescue nil
+  end
+
+  def unlink_tmpdir_safe(tmpdir)
+    Dir.rmdir(tmpdir) rescue nil
   end
 
   # returns a PID if a given path contains a non-stale PID file,

@@ -259,6 +259,12 @@ class Unicorn::Configurator
     set_bool(:worker_exec, bool)
   end
 
+  # Wether to fork replacement workers from existing workers or from the master.
+  # This can improve Copy on Write effectiveness.
+  def worker_refork(bool)
+    set_bool(:worker_refork, bool)
+  end
+
   # sets the current number of worker_processes to +nr+.  Each worker
   # process will serve exactly one client at a time.  You can
   # increment or decrement this value at runtime by sending SIGTTIN

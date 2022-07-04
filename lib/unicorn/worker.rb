@@ -29,7 +29,7 @@ class Unicorn::Worker
 
   def atfork_child # :nodoc:
     # we _must_ close in child, parent just holds this open to signal
-    @master = @master.close
+    @master = @master.close if @master
   end
 
   # master fakes SIGQUIT using this
@@ -47,15 +47,15 @@ class Unicorn::Worker
   # that signal delivery may be deferred.  We want to avoid signal delivery
   # while the Rack app.call is running because some database drivers
   # (e.g. ruby-pg) may cancel pending requests.
-  def fake_sig(sig) # :nodoc:
+  def fake_sig(sig, argument = 0) # :nodoc:
     old_cb = trap(sig, "IGNORE")
-    old_cb.call
+    old_cb.call(argument)
   ensure
     trap(sig, old_cb)
   end
 
   # master sends fake signals to children
-  def soft_kill(sig) # :nodoc:
+  def soft_kill(sig, argument = 0) # :nodoc:
     case sig
     when Integer
       signum = sig
@@ -65,22 +65,29 @@ class Unicorn::Worker
     end
     # writing and reading 4 bytes on a pipe is atomic on all POSIX platforms
     # Do not care in the odd case the buffer is full, here.
-    @master.kgio_trywrite([signum].pack('l'))
+    @master.kgio_trywrite([signum + (argument << 16)].pack('l'))
   rescue Errno::EPIPE
     # worker will be reaped soon
   end
 
   # this only runs when the Rack app.call is not running
   # act like a listener
-  def kgio_tryaccept # :nodoc:
+  def kgio_tryaccept(wait_for_master = nil) # :nodoc:
     case buf = @to_io.kgio_tryread(4)
     when String
       # unpack the buffer and trigger the signal handler
-      signum = buf.unpack('l')
-      fake_sig(signum[0])
+      signum = buf.unpack('l')[0]
+      argument = signum >> 16
+      signum -= (argument << 16)
+      fake_sig(signum, argument)
       # keep looping, more signals may be queued
     when nil # EOF: master died, but we are at a safe place to exit
-      fake_sig(:QUIT)
+      if wait_for_master && wait_for_master > 0
+        wait_for_master -= 0.1
+        sleep 0.1
+      else
+        fake_sig(:QUIT)
+      end
     when :wait_readable # keep waiting
       return false
     end while true # loop, as multiple signals may be sent

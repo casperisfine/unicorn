@@ -38,6 +38,7 @@ Gem::Specification.new do |s|
 
   s.add_dependency(%q<kgio>, '~> 2.6')
   s.add_dependency(%q<raindrops>, '~> 0.7')
+  s.add_dependency(%q<child_subreaper>)
 
   s.add_development_dependency('test-unit', '~> 3.0')
 
