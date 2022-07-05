@@ -39,6 +39,10 @@ https://yhbt.net/unicorn/examples/init.sh
 * WINCH - gracefully stops workers but keep the master running.
   This will only work for daemonized processes.
 
+* URG - promote one of the existing workers as a new master, and gracefully
+  stop workers.
+  This will only work for daemonized processes.
+
 * TTIN - increment the number of worker processes by one
 
 * TTOU - decrement the number of worker processes by one

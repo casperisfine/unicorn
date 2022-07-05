@@ -133,6 +133,6 @@ end
 # :enddoc:
 
 %w(const socket_helper stream_input tee_input http_request configurator
-   tmpio util http_response worker http_server).each do |s|
+   tmpio util http_response worker promoted_worker http_server).each do |s|
   require_relative "unicorn/#{s}"
 end

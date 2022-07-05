@@ -50,6 +50,7 @@ class Unicorn::HttpServer
   #   Unicorn::HttpServer::START_CTX[0] = "/home/bofh/2.3.0/bin/unicorn"
   START_CTX = {
     :argv => ARGV.map(&:dup),
+    :generation => 0,
     0 => $0.dup,
   }
   # We favor ENV['PWD'] since it is (usually) symlink aware for Capistrano
@@ -106,7 +107,7 @@ class Unicorn::HttpServer
     @orig_app = app
     # list of signals we care about and trap in master.
     @queue_sigs = [
-      :WINCH, :QUIT, :INT, :TERM, :USR1, :USR2, :HUP, :TTIN, :TTOU ]
+      :WINCH, :QUIT, :INT, :TERM, :USR1, :USR2, :HUP, :TTIN, :TTOU, :URG ]
 
     @worker_data = if worker_data = ENV['UNICORN_WORKER']
       worker_data = worker_data.split(',').map!(&:to_i)
@@ -119,17 +120,9 @@ class Unicorn::HttpServer
 
   # Runs the thing.  Returns self so you can run join on it
   def start
+    @new_master = false
     inherit_listeners!
-    # this pipe is used to wake us up from select(2) in #join when signals
-    # are trapped.  See trap_deferred.
-    @self_pipe.replace(Unicorn.pipe)
-    @master_pid = @worker_data ? Process.ppid : $$
-
-    # setup signal handlers before writing pid file in case people get
-    # trigger happy and send signals as soon as the pid file exists.
-    # Note that signals don't actually get handled until the #join method
-    @queue_sigs.each { |sig| trap(sig) { @sig_queue << sig; awaken_master } }
-    trap(:CHLD) { awaken_master }
+    promote
 
     # write pid early for Mongrel compatibility if we're not inheriting sockets
     # This is needed for compatibility some Monit setups at least.
@@ -142,6 +135,19 @@ class Unicorn::HttpServer
 
     spawn_missing_workers
     self
+  end
+
+  def promote
+    # this pipe is used to wake us up from select(2) in #join when signals
+    # are trapped.  See trap_deferred.
+    @self_pipe.replace(Unicorn.pipe)
+    @master_pid = @worker_data ? Process.ppid : $$
+
+    # setup signal handlers before writing pid file in case people get
+    # trigger happy and send signals as soon as the pid file exists.
+    # Note that signals don't actually get handled until the #join method
+    @queue_sigs.each { |sig| trap(sig) { @sig_queue << sig; awaken_master } }
+    trap(:CHLD) { awaken_master }
   end
 
   # replaces current listener set with +listeners+.  This will
@@ -178,16 +184,16 @@ class Unicorn::HttpServer
     Unicorn::HttpRequest::DEFAULTS["rack.logger"] = @logger = obj
   end
 
-  def clobber_pid(path)
+  def clobber_pid(path, content = $$)
     unlink_pid_safe(@pid) if @pid
     if path
       fp = begin
-        tmp = "#{File.dirname(path)}/#{rand}.#$$"
+        tmp = "#{File.dirname(path)}/#{rand}.#{content}"
         File.open(tmp, File::RDWR|File::CREAT|File::EXCL, 0644)
       rescue Errno::EEXIST
         retry
       end
-      fp.syswrite("#$$\n")
+      fp.syswrite("#{content}\n")
       File.rename(fp.path, path)
       fp.close
     end
@@ -279,6 +285,11 @@ class Unicorn::HttpServer
       end
       @ready_pipe = @ready_pipe.close rescue nil
     end
+
+    if @promoted
+      Process.kill(:WINCH, Process.ppid)
+    end
+
     begin
       reap_all_workers
       case @sig_queue.shift
@@ -292,6 +303,13 @@ class Unicorn::HttpServer
           @logger.debug("waiting #{sleep_time}s after suspend/hibernation")
         end
         maintain_worker_count if respawn
+
+        if @new_master && @new_master.ready? && @workers.empty?
+          # TODO: we should handle the new master dying like with reexec.
+          clobber_pid(pid, @new_master.pid)
+          break
+        end
+
         master_sleep(sleep_time)
       when :QUIT # graceful shutdown
         break
@@ -305,10 +323,20 @@ class Unicorn::HttpServer
         soft_kill_each_worker(:USR1)
       when :USR2 # exec binary, stay alive in case something went wrong
         reexec
+      when :URG
+        if $stdin.tty?
+          logger.info "SIGURG ignored because we're not daemonized"
+        else
+          promote_new_master
+        end
       when :WINCH
         if $stdin.tty?
           logger.info "SIGWINCH ignored because we're not daemonized"
         else
+          if @new_master
+            @new_master.ready!
+          end
+
           respawn = false
           logger.info "gracefully stopping all workers"
           soft_kill_each_worker(:QUIT)
@@ -408,9 +436,28 @@ class Unicorn::HttpServer
         worker = @workers.delete(wpid) and worker.close rescue nil
         @after_worker_exit.call(self, worker, status)
       end
+
+      if @new_master && @new_master.ready?
+        @new_master.scale(@workers.size)
+      end
     rescue Errno::ECHILD
       break
     end while true
+  end
+
+  def promote_new_master
+    # Promoting the oldest worker
+    # TODO: handle `@new_master` being dead.
+    if @new_master
+      logger.error "can't promote because worker=#{@new_master.nr} is being promoted"
+    elsif pair = @workers.first
+      @new_master = Unicorn::PromotedWorker.new(*pair, worker_processes)
+      @workers.delete(@new_master.pid)
+      logger.info "master promoting worker=#{@new_master.worker.nr}"
+      @new_master.promote
+    else
+      logger.error "can't promote because there is no existing workers"
+    end
   end
 
   # reexecutes the START_CTX with a new binary
@@ -516,10 +563,11 @@ class Unicorn::HttpServer
   end
 
   def after_fork_internal
+    self.worker_processes = 0
     @self_pipe.each(&:close).clear # this is master-only, now
     @ready_pipe.close if @ready_pipe
     Unicorn::Configurator::RACKUP.clear
-    @ready_pipe = @init_listeners = @before_exec = @before_fork = nil
+    @ready_pipe = nil
 
     # The OpenSSL PRNG is seeded with only the pid, and apps with frequently
     # dying workers can recycle pids
@@ -545,6 +593,13 @@ class Unicorn::HttpServer
       unless pid
         after_fork_internal
         worker_loop(worker)
+
+        if @promoted
+          worker.tick = 0
+          promote
+          join
+        end
+
         exit
       end
 
@@ -678,19 +733,22 @@ class Unicorn::HttpServer
     trap(:CHLD, 'DEFAULT')
     @sig_queue.clear
     proc_name "worker[#{worker.nr}]"
-    START_CTX.clear
     @workers.clear
 
     after_fork.call(self, worker) # can drop perms and create listeners
     LISTENERS.each { |sock| sock.close_on_exec = true }
 
     worker.user(*user) if user.kind_of?(Array) && ! worker.switched
-    @config = nil
     build_app! unless preload_app
-    @after_fork = @listener_opts = @orig_app = nil
+    @listener_opts = @orig_app = nil
     readers = LISTENERS.dup
     readers << worker
     trap(:QUIT) { nuke_listeners!(readers) }
+    @promoted = false
+    trap(:URG) do
+      @promoted = true
+      START_CTX[:generation] += 1
+    end
     readers
   end
 
@@ -706,11 +764,11 @@ class Unicorn::HttpServer
 
   def prep_readers(readers)
     wtr = Unicorn::Waiter.prep_readers(readers)
-    @timeout *= 500 # to milliseconds for epoll, but halved
+    @select_timeout = @timeout * 500 # to milliseconds for epoll, but halved
     wtr
   rescue
     require_relative 'select_waiter'
-    @timeout /= 2.0 # halved for IO.select
+    @select_timeout = @timeout / 2.0 # halved for IO.select
     Unicorn::SelectWaiter.new
   end
 
@@ -720,7 +778,7 @@ class Unicorn::HttpServer
   def worker_loop(worker)
     readers = init_worker_process(worker)
     waiter = prep_readers(readers)
-    reopen = false
+    promote = reopen = false
 
     # this only works immediately if the master sent us the signal
     # (which is the normal case)
@@ -739,12 +797,17 @@ class Unicorn::HttpServer
           process_client(client)
           worker.tick = time_now.to_i
         end
+        if @promoted
+          worker.tick = time_now.to_i
+          return
+        end
+
         break if reopen
       end
 
       # timeout so we can .tick and keep parent from SIGKILL-ing us
       worker.tick = time_now.to_i
-      waiter.get_readers(ready, readers, @timeout)
+      waiter.get_readers(ready, readers, @select_timeout)
     rescue => e
       redo if reopen && readers[0]
       Unicorn.log_error(@logger, "listen loop error", e) if readers[0]
@@ -823,8 +886,8 @@ class Unicorn::HttpServer
   end
 
   def proc_name(tag)
-    $0 = ([ File.basename(START_CTX[0]), tag
-          ]).concat(START_CTX[:argv]).join(' ')
+    $0 = ([ File.basename(START_CTX[0]), tag, "(gen: #{START_CTX[:generation]})",
+          ]).concat(START_CTX[:argv]).compact.join(' ')
   end
 
   def redirect_io(io, path)
