@@ -7,7 +7,7 @@ $gc_started = false
 
 # Mock GC.start
 def GC.start
-  ObjectSpace.each_object(Kgio::Socket) do |x|
+  ObjectSpace.each_object(Socket) do |x|
     x.closed? or abort "not closed #{x}"
   end
   $gc_started = true
